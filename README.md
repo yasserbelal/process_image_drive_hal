@@ -146,77 +146,115 @@ independently (e.g. a quick-stop bit set by a safety function).
 > This section describes the design. The base implementation is single-threaded as required.
 
 ### The scenario
-
+ 
 Two threads run concurrently:
+ 
+- **Application thread**: It writes a command via `hal.set_command()` or `hal.set_enable()` and captures feedback. 
+- **Safety monitor thread**: runs independently, at its own pace. It periodically calls `hal.get_actual_position()`,
+  and if the position leaves a configured range, calls `hal.set_enable(false)` to clear only the enable bit.
+  Once the position is back inside range, it allows `hal.set_enable(true)` again.
+  
+Both threads touch the shared process image: the application thread writes the full command into `shadow_out` and reads `shadow_in`.
+The safety monitor thread also writes `shadow_out` (only the enable bit, via `set_enable()`) and reads `shadow_in` (only position,
+via `get_actual_position()`).
 
-- **Cycle thread**: calls `pi.cycle()` every 1 ms. Before each cycle it may modify the 
-control word (e.g. clear enable when the safety monitor detects a position violation).
-- **Application thread**: calls `hal.set_command()` and
-  `hal.get_feedback()` at any time.
-
-Both threads write and read `shadow_out`. This represents a data race by the C++ memory model, which is 
-undefined behaviour and can corrupt the control word in practice (torn reads, reordering).
+The application thread's write of the full command and the safety monitor's write of just the enable bit can land
+on `shadow_out` at the same time.
+That overlap is a data race by the C++ memory model, which is undefined behaviour and can corrupt the
+control word in practice (torn reads, reordering).
 
 ### What can go wrong
-
-Imagine the application thread executes `set_command()` which does:
-
+ 
+Imagine the application thread executes `set_command()`, which does a read-modify-write of the 
+control word to set the enable bit alongside writing position and torque:
+ 
 ```
 read ctrl_word  →  0x0000
 set bit 0       →  0x0001
 write ctrl_word →  shadow_out[8] = 0x01, shadow_out[9] = 0x00
 ```
-
-If the cycle thread simultaneously executes `set_enable(false)`, from a Safety monitor thread
-which reads `0x0001` and writes `0x0000`, the interleaving can produce any result: both writes could land, 
-one could be lost, or a torn 16-bit write (byte 8 from thread A, byte 9 from thread B) could produce `0xFF01`.
+ 
+If the safety monitor thread simultaneously executes `set_enable(false)`,
+which performs its own read-modify-write of the same two bytes:
+ 
+```
+read ctrl_word  →  0x0001
+clear bit 0     →  0x0000
+write ctrl_word →  shadow_out[8] = 0x00, shadow_out[9] = 0x00
+```
+ 
+The two read-modify-write sequences can interleave in any order. 
+Possible outcomes: the safety monitor's clear is silently lost (application thread's
+write happens last, leaving the drive enabled despite an out-of-range position) or 
+a torn write produces a control word that was never intended by either thread. 
+Either outcome is unacceptable for a safety function losing the disable request is the more dangerous of the two.
 
 ### Correct solution: a mutex protecting the output shadow
-
+  
 ```cpp
 // In ProcessImage:
 mutable std::mutex shadow_out_mutex_;
-
-void cycle() 
+ 
+void write_u16(size_t offset, uint16_t value) {
+    std::lock_guard<std::mutex> lk(shadow_out_mutex_);
+    // ... byte-by-byte write as before
+}
+ 
+void cycle()
 {
     // Step 1: flush application commands to the wire output buffer.
     {
         std::lock_guard<std::mutex> lk(shadow_out_mutex_);  // constructor: lock()
         std::memcpy(bus_.output_buf(), shadow_out_.data(), FRAME_SIZE);
     }   // destructor: unlock()
-    
+
     // Step 2: bus exchange (loopback).
     bus_.exchange();
 
     // Step 3: capture device feedback into the shadow input buffer.
-    // shadow_in is written only by cycle() so no lock needed if only one cycle thread exists. 
+    // shadow_in is written only by cycle(), which only the application thread calls.
+    // So no lock needed.
     std::memcpy(shadow_in_.data(), bus_.input_buf(), FRAME_SIZE);
 }
 ```
+ 
+Both `set_command()` (called by the application thread) and `set_enable()` (called by the safety monitor thread) 
+acquire `shadow_out_mutex_` for the duration of their read-modify-write sequence not just for an individual 
+byte write. So one thread's full update to the control word always completes before the other's begins. 
+This eliminates the interleaving shown above: whichever thread acquires the lock first finishes its complete 
+read-modify-write before the other can start, so the safety monitor's disable request can never be silently
+overwritten mid-sequence.
+ 
+For `shadow_in` (feedback), only the application thread's `cycle()` call writes it, and the safety monitor 
+thread only reads it (via `get_actual_position()`). Because there is exactly one writer, a mutex
+can often be omitted.
+
+---
 
 ### Safety monitor thread
-
+ 
 ```cpp
-void safety_monitor(ProcessImage& pi, DriveHAL& hal,
-                    int32_t pos_min, int32_t pos_max) 
+void safety_monitor(DriveHAL& hal, int32_t pos_min, int32_t pos_max)
 {
-    while (running) 
+    while (running)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));  
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
         const int32_t pos = hal.get_actual_position();
-        if (pos < pos_min || pos > pos_max) 
+        if (pos < pos_min || pos > pos_max)
         {
             hal.set_enable(false);   // mutex-protected write to shadow_out
         }
-        // When back in range: do nothing — application thread re-enables.
+        // When back in range: do nothing here. The application thread's
+        // own set_command()/set_enable(true) calls are what re-enable.
     }
 }
 ```
+ 
+`set_enable()` acquires `shadow_out_mutex_`, so it is safe to call from the safety monitor thread 
+while the application thread concurrently calls `set_command()` in its own loop. 
+If the application thread requests enable in the same cycle the safety monitor requests disable, 
+the mutex ensures one read-modify-write fully completes before the other begins.
+Last writer wins, which for a single enable bit is the correct, safe behaviour.
 
-The `set_enable()` call acquires the shadow mutex, so it is safe to call from any thread. 
-The application thread calling `set_enable(true)` races with the monitor calling 
-`set_enable(false)`, but because both operations are mutex-protected, the race is eliminated,
-last writer wins, which is correct behaviour for an enable flag.
-
----
+```
 
